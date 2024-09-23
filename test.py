@@ -1,19 +1,20 @@
-try_catch() {
-  local retries=$1
-  local delay=$2
-  local command=$3
-  local quiet=$4
+def delete_item_from_dynamo(ecr_repo_name, table_name):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table(table_name)
 
-  for i in $(seq 1 $retries); do
-    if [ "$quiet" = "quite" ]; then
-            output=$($command) > /dev/null && return 0
-    else
-            output=$($command) && return 0
-    fi
-    echo "Command failed, retrying in $delay seconds..."
-    sleep $delay
-  done
+    try:
+        delete_response = table.delete_item(Key={'ecr_repo_name': ecr_repo_name})
+        if delete_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+            print(f"Item with ecr_repo_name '{ecr_repo_name}' deleted successfully.")
+        else:
+            print(f"Error deleting item: {delete_response}")
+    except Exception as e:
+        print(f"Error deleting item: {str(e)}")
 
-  echo "Command failed after $retries retries: $command"
-  return 1
-}
+
+def main(ecr_repo_name, table_name):
+    try:
+        abc()  # Call the function
+        delete_records(ecr_repo_name, table_name)  # Delete records on success
+    except Exception as e:
+        print(f"Error executing function abc(): {str(e)}")
