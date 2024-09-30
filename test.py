@@ -18,3 +18,7 @@ def main(ecr_repo_name, table_name):
         delete_records(ecr_repo_name, table_name)  # Delete records on success
     except Exception as e:
         print(f"Error executing function abc(): {str(e)}")
+
+
+    git_core_path = os.path.join(os.environ['LAMBDA_TASK_ROOT'], 'layer', 'libexec', 'git-core')
+    os.environ['PATH'] += ':' + git_core_path
