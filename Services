@@ -1,0 +1,97 @@
+# Services Configuration File
+# Users can add new services here without modifying .gitlab-ci.yml
+# The CI pipeline will automatically detect changes and build only affected services
+
+services:
+  # Web Application Service
+  - name: web-app
+    directory: web-app
+    image_name: web-app  # Optional: defaults to service name
+    dockerfile_path: Dockerfile  # Optional: defaults to "Dockerfile"
+    build_context: web-app  # Optional: defaults to directory
+    build_args:  # Optional: build arguments for Docker build
+      NODE_ENV: production
+      VERSION: "1.0.0"
+    tags:  # Optional: additional tags beyond 'latest' and commit SHA
+      - stable
+      - v1.0
+
+  # API Server Service
+  - name: api-server
+    directory: api-server
+    image_name: api-server
+    dockerfile_path: Dockerfile
+    build_context: api-server
+    build_args:
+      ENVIRONMENT: production
+      PORT: "8080"
+    tags:
+      - production
+
+  # Background Worker Service
+  - name: worker
+    directory: worker
+    image_name: background-worker  # Different image name than service name
+    dockerfile_path: Dockerfile
+    build_context: worker
+
+  # Database Service (minimal configuration)
+  - name: database
+    directory: database
+    # All other fields will use defaults
+
+  # Microservice with custom Dockerfile location
+  - name: auth-service
+    directory: services/auth
+    image_name: auth-microservice
+    dockerfile_path: docker/Dockerfile  # Custom Dockerfile location
+    build_context: services/auth
+    build_args:
+      JWT_SECRET_LENGTH: "32"
+    tags:
+      - auth-v2
+
+  # Frontend service with complex build
+  - name: frontend
+    directory: frontend
+    image_name: react-frontend
+    dockerfile_path: Dockerfile.prod
+    build_context: .  # Build from repository root
+    build_args:
+      REACT_APP_API_URL: https://api.example.com
+      REACT_APP_ENV: production
+    tags:
+      - ui-latest
+      - stable
+
+# Configuration Options Explained:
+# 
+# Required Fields:
+#   - name: Unique service identifier
+#   - directory: Directory containing the service code
+#
+# Optional Fields:
+#   - image_name: ECR repository name (defaults to service name)
+#   - dockerfile_path: Path to Dockerfile relative to directory (defaults to "Dockerfile")  
+#   - build_context: Build context for Docker build (defaults to directory)
+#   - build_args: Key-value pairs for Docker build arguments
+#   - tags: Additional tags to apply to the image (beyond 'latest' and commit SHA)
+#
+# Examples for adding a new service:
+#
+# Simple service (minimal config):
+# - name: my-new-service
+#   directory: my-new-service
+#
+# Complex service (full config):  
+# - name: complex-service
+#   directory: services/complex
+#   image_name: my-complex-service
+#   dockerfile_path: docker/Dockerfile.prod
+#   build_context: services/complex
+#   build_args:
+#     ENV: production
+#     VERSION: "2.1.0"
+#   tags:
+#     - v2.1
+#     - production-ready
