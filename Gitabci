@@ -1,0 +1,331 @@
+# GitLab CI Pipeline for Building and Pushing Docker Images to AWS ECR
+# This pipeline reads service metadata from services.yml and builds only changed services
+
+variables:
+  # AWS Configuration
+  AWS_DEFAULT_REGION: us-west-2  # Change to your preferred region
+  ECR_REGISTRY: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+  
+  # Configuration
+  SERVICES_CONFIG_FILE: "services.yml"
+  
+  # Docker Configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+stages:
+  - validate-config
+  - detect-changes
+  - build-and-push
+
+# Service for Docker-in-Docker
+services:
+  - docker:24.0.5-dind
+
+before_script:
+  - apk add --no-cache aws-cli git yq
+  - docker --version
+  - aws --version
+
+# Validate the services configuration file
+validate-config:
+  stage: validate-config
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yq
+  script:
+    - |
+      if [ ! -f "$SERVICES_CONFIG_FILE" ]; then
+        echo "Error: $SERVICES_CONFIG_FILE not found!"
+        echo "Please create a services.yml file in the repository root."
+        exit 1
+      fi
+      
+      echo "Validating services configuration..."
+      yq eval '.services' $SERVICES_CONFIG_FILE > /dev/null || {
+        echo "Error: Invalid YAML format in $SERVICES_CONFIG_FILE"
+        exit 1
+      }
+      
+      # Check if all specified directories exist and contain Dockerfile
+      MISSING_DIRS=""
+      MISSING_DOCKERFILES=""
+      
+      for service in $(yq eval '.services[].name' $SERVICES_CONFIG_FILE); do
+        dir=$(yq eval ".services[] | select(.name == \"$service\") | .directory" $SERVICES_CONFIG_FILE)
+        
+        if [ ! -d "$dir" ]; then
+          MISSING_DIRS="$MISSING_DIRS $service:$dir"
+        elif [ ! -f "$dir/Dockerfile" ]; then
+          MISSING_DOCKERFILES="$MISSING_DOCKERFILES $service:$dir"
+        fi
+      done
+      
+      if [ -n "$MISSING_DIRS" ]; then
+        echo "Error: The following directories don't exist:"
+        for item in $MISSING_DIRS; do
+          echo "  - Service '${item%:*}': directory '${item#*:}'"
+        done
+        exit 1
+      fi
+      
+      if [ -n "$MISSING_DOCKERFILES" ]; then
+        echo "Error: The following directories don't contain Dockerfile:"
+        for item in $MISSING_DOCKERFILES; do
+          echo "  - Service '${item%:*}': directory '${item#*:}'"
+        done
+        exit 1
+      fi
+      
+      echo "Configuration validation successful!"
+      
+      # Display configured services
+      echo ""
+      echo "Configured services:"
+      yq eval '.services[] | "  - " + .name + " (directory: " + .directory + ", image: " + (.image_name // .name) + ")"' $SERVICES_CONFIG_FILE
+
+# Job to detect which services have changes
+detect-changes:
+  stage: detect-changes
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git yq
+  script:
+    - |
+      echo "Reading services configuration from $SERVICES_CONFIG_FILE"
+      
+      # Get all configured services
+      SERVICES=$(yq eval '.services[].name' $SERVICES_CONFIG_FILE | tr '\n' ' ')
+      echo "All configured services: $SERVICES"
+      
+      # Detect changed services
+      CHANGED_SERVICES=""
+      
+      if [ "$CI_COMMIT_SHA" != "$CI_COMMIT_BEFORE_SHA" ] && [ -n "$CI_COMMIT_BEFORE_SHA" ]; then
+        # Get changed files between commits
+        CHANGED_FILES=$(git diff --name-only $CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA)
+        echo "Changed files:"
+        echo "$CHANGED_FILES"
+        echo ""
+        
+        # Check if services.yml itself was changed
+        SERVICES_CONFIG_CHANGED=false
+        if echo "$CHANGED_FILES" | grep -q "^$SERVICES_CONFIG_FILE$"; then
+          echo "Services configuration file was changed - will build all services"
+          SERVICES_CONFIG_CHANGED=true
+        fi
+        
+        # Find services with changes
+        for service in $SERVICES; do
+          service_dir=$(yq eval ".services[] | select(.name == \"$service\") | .directory" $SERVICES_CONFIG_FILE)
+          
+          if [ "$SERVICES_CONFIG_CHANGED" = "true" ]; then
+            # If config changed, build all services
+            CHANGED_SERVICES="$CHANGED_SERVICES $service"
+          elif echo "$CHANGED_FILES" | grep -q "^$service_dir/"; then
+            echo "Changes detected in service '$service' (directory: $service_dir)"
+            CHANGED_SERVICES="$CHANGED_SERVICES $service"
+          fi
+        done
+        
+        if [ -n "$CHANGED_SERVICES" ]; then
+          echo ""
+          echo "Services to build: $CHANGED_SERVICES"
+        else
+          echo "No services have changes"
+        fi
+      else
+        # First commit, manual trigger, or no previous commit - build all services
+        echo "Building all services (first commit, manual trigger, or no previous commit)"
+        CHANGED_SERVICES="$SERVICES"
+      fi
+      
+      # Save results for next stage
+      echo "$CHANGED_SERVICES" > changed_services.txt
+      
+      # Create service metadata file for build stage
+      echo "services:" > services_to_build.yml
+      for service in $CHANGED_SERVICES; do
+        if [ -n "$service" ]; then
+          yq eval ".services[] | select(.name == \"$service\")" $SERVICES_CONFIG_FILE >> services_to_build.yml
+        fi
+      done
+      
+      if [ -n "$CHANGED_SERVICES" ]; then
+        echo ""
+        echo "Services metadata for build stage:"
+        cat services_to_build.yml
+      fi
+  artifacts:
+    paths:
+      - changed_services.txt
+      - services_to_build.yml
+    expire_in: 1 hour
+  dependencies:
+    - validate-config
+
+# Dynamic build job that processes all changed services
+build-and-push:
+  stage: build-and-push
+  image: docker:24.0.5
+  before_script:
+    - apk add --no-cache aws-cli yq
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+  script:
+    - |
+      # Check if there are services to build
+      if [ ! -f services_to_build.yml ] || [ ! -s services_to_build.yml ]; then
+        echo "No services to build"
+        exit 0
+      fi
+      
+      CHANGED_SERVICES=$(cat changed_services.txt)
+      if [ -z "$CHANGED_SERVICES" ]; then
+        echo "No services to build"
+        exit 0
+      fi
+      
+      echo "Building services: $CHANGED_SERVICES"
+      echo ""
+      
+      # Build each changed service
+      for service in $CHANGED_SERVICES; do
+        if [ -z "$service" ]; then
+          continue
+        fi
+        
+        echo "========================================"
+        echo "Processing service: $service"
+        echo "========================================"
+        
+        # Extract service configuration
+        SERVICE_DIR=$(yq eval ".services[] | select(.name == \"$service\") | .directory" services_to_build.yml)
+        IMAGE_NAME=$(yq eval ".services[] | select(.name == \"$service\") | .image_name // .name" services_to_build.yml)
+        DOCKERFILE_PATH=$(yq eval ".services[] | select(.name == \"$service\") | .dockerfile_path // \"Dockerfile\"" services_to_build.yml)
+        BUILD_CONTEXT=$(yq eval ".services[] | select(.name == \"$service\") | .build_context // .directory" services_to_build.yml)
+        BUILD_ARGS=$(yq eval ".services[] | select(.name == \"$service\") | .build_args // {}" services_to_build.yml)
+        TAGS=$(yq eval ".services[] | select(.name == \"$service\") | .tags // []" services_to_build.yml)
+        
+        echo "Configuration:"
+        echo "  - Service: $service"
+        echo "  - Directory: $SERVICE_DIR"
+        echo "  - Image Name: $IMAGE_NAME"
+        echo "  - Dockerfile: $SERVICE_DIR/$DOCKERFILE_PATH"
+        echo "  - Build Context: $BUILD_CONTEXT"
+        
+        # Verify directory and Dockerfile exist
+        if [ ! -d "$SERVICE_DIR" ]; then
+          echo "Error: Directory $SERVICE_DIR does not exist"
+          exit 1
+        fi
+        
+        if [ ! -f "$SERVICE_DIR/$DOCKERFILE_PATH" ]; then
+          echo "Error: Dockerfile not found at $SERVICE_DIR/$DOCKERFILE_PATH"
+          exit 1
+        fi
+        
+        FULL_IMAGE_NAME=$ECR_REGISTRY/$IMAGE_NAME
+        
+        # Create ECR repository if it doesn't exist
+        echo "Ensuring ECR repository exists: $IMAGE_NAME"
+        aws ecr describe-repositories --repository-names $IMAGE_NAME --region $AWS_DEFAULT_REGION 2>/dev/null || \
+          aws ecr create-repository --repository-name $IMAGE_NAME --region $AWS_DEFAULT_REGION
+        
+        # Prepare build command
+        BUILD_CMD="docker build -f $SERVICE_DIR/$DOCKERFILE_PATH"
+        
+        # Add build args if specified
+        if [ "$BUILD_ARGS" != "null" ] && [ "$BUILD_ARGS" != "{}" ]; then
+          echo "  - Build Args: $BUILD_ARGS"
+          for arg in $(yq eval '.services[] | select(.name == "'"$service"'") | .build_args | to_entries | .[] | .key + "=" + .value' services_to_build.yml 2>/dev/null || echo ""); do
+            if [ -n "$arg" ]; then
+              BUILD_CMD="$BUILD_CMD --build-arg $arg"
+            fi
+          done
+        fi
+        
+        # Add default tags
+        BUILD_CMD="$BUILD_CMD -t $FULL_IMAGE_NAME:$CI_COMMIT_SHORT_SHA -t $FULL_IMAGE_NAME:latest"
+        
+        # Add custom tags if specified
+        if [ "$TAGS" != "null" ] && [ "$TAGS" != "[]" ]; then
+          CUSTOM_TAGS=$(yq eval '.services[] | select(.name == "'"$service"'") | .tags[]?' services_to_build.yml 2>/dev/null || echo "")
+          echo "  - Custom Tags: $CUSTOM_TAGS"
+          for tag in $CUSTOM_TAGS; do
+            if [ -n "$tag" ] && [ "$tag" != "null" ]; then
+              BUILD_CMD="$BUILD_CMD -t $FULL_IMAGE_NAME:$tag"
+            fi
+          done
+        fi
+        
+        # Add build context
+        BUILD_CMD="$BUILD_CMD $BUILD_CONTEXT"
+        
+        # Build the Docker image
+        echo ""
+        echo "Building Docker image..."
+        echo "Command: $BUILD_CMD"
+        eval $BUILD_CMD
+        
+        if [ $? -ne 0 ]; then
+          echo "Error: Failed to build image for service $service"
+          exit 1
+        fi
+        
+        # Push all tags
+        echo ""
+        echo "Pushing images to ECR..."
+        docker push $FULL_IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+        docker push $FULL_IMAGE_NAME:latest
+        
+        # Push custom tags
+        if [ "$TAGS" != "null" ] && [ "$TAGS" != "[]" ]; then
+          for tag in $CUSTOM_TAGS; do
+            if [ -n "$tag" ] && [ "$tag" != "null" ]; then
+              echo "Pushing custom tag: $tag"
+              docker push $FULL_IMAGE_NAME:$tag
+            fi
+          done
+        fi
+        
+        echo "✓ Successfully built and pushed $service"
+        echo ""
+      done
+      
+      echo "========================================"
+      echo "All services built and pushed successfully!"
+      echo "========================================"
+  dependencies:
+    - detect-changes
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# Optional: Job to list built images
+summary:
+  stage: .post
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yq
+  script:
+    - |
+      if [ -f changed_services.txt ]; then
+        CHANGED_SERVICES=$(cat changed_services.txt)
+        if [ -n "$CHANGED_SERVICES" ]; then
+          echo "Built and pushed the following services:"
+          for service in $CHANGED_SERVICES; do
+            if [ -n "$service" ]; then
+              IMAGE_NAME=$(yq eval ".services[] | select(.name == \"$service\") | .image_name // .name" $SERVICES_CONFIG_FILE)
+              echo "  ✓ $service -> $ECR_REGISTRY/$IMAGE_NAME"
+            fi
+          done
+        else
+          echo "No services were built (no changes detected)"
+        fi
+      else
+        echo "No build information available"
+      fi
+  dependencies:
+    - detect-changes
+  when: always
